@@ -17,6 +17,7 @@ use lapin::types::ShortString;
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, Consumer, ExchangeKind};
 use serde::{Deserialize, Serialize};
 use serde_repr::*;
+use std::env;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -25,6 +26,21 @@ pub const ROUTING_KEY_PREFIX_MONITOR: &str = "monitor";
 pub const ROUTING_KEY_SUFFIX_BITSWAP_MESSAGES: &str = "bitswap_messages";
 pub const ROUTING_KEY_SUFFIX_CONNECTION_EVENTS: &str = "conn_events";
 pub const EXCHANGE_NAME_PASSIVE_MONITORING: &str = "ipfs.passive_monitoring";
+
+async fn write_log_to_file(monitor_name: &str, log_message: &[u8]) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use tokio::fs;
+    use tokio::io::AsyncWriteExt;
+
+    let date = chrono::Utc::now().format("%Y-%m-%d-%H-%M-%S-%3f");
+    let log_dir = format!("/ipfs-tools/archive/{}/", monitor_name);
+    let log_file = format!("{}{}.json.gz", log_dir, date);
+
+    fs::create_dir_all(&log_dir).await?;
+    let mut file = fs::File::create(log_file).await?;
+    file.write_all(log_message).await?;
+
+    Ok(())
+}
 
 async fn connect(addr: &str) -> Result<Connection> {
     let conn = Connection::connect(addr, ConnectionProperties::default()).await?;
@@ -275,9 +291,25 @@ impl MonitoringClient {
                                 }
                                 return;
                             }
-                            if let Err(_) = msg_out.send(Ok((key, msg))).await {
+                            if let Err(_) = msg_out.send(Ok((key.clone(), msg.clone()))).await {
                                 debug!("unable to pass on decoded message, quitting");
                                 return;
+                            }
+    
+                            if let RoutingKeyInformation::BitswapMessages { ref monitor_name } = key {
+                                let log_message = match encode_messages(&msg) {
+                                    Ok(log_message) => log_message,
+                                    Err(e) => {
+                                        error!("Error encoding messages: {:?}", e);
+                                        continue;
+                                    }
+                                };
+                                
+                                if let Ok(_) = env::var("ENABLE_LOGGING") {
+                                    if let Err(e) = write_log_to_file(monitor_name, &log_message).await {
+                                        error!("Error writing log to file: {:?}", e);
+                                    }
+                                }
                             }
                         }
                         Err(err) => {
