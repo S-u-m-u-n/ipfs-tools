@@ -19,13 +19,16 @@ use prom::{Geolocation, Metrics};
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+
 use tokio::sync::RwLock;
 
 mod config;
 mod gateways;
 mod geolocation;
 mod prom;
+mod monitor_tasks;
+use monitor_tasks::MonitorTasks;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -100,6 +103,9 @@ async fn run_with_config(cfg: Config) -> Result<()> {
     prom::run_prometheus(prometheus_address)?;
     info!("started prometheus server");
 
+    // Create a HashMap to store MonitorTasks for each monitor
+    let monitor_tasks_map = Arc::new(RwLock::new(HashMap::new()));
+
     // Connect to monitors
     info!("starting infinite connection loop, try Ctrl+C to exit");
     let handles = cfg
@@ -113,6 +119,7 @@ async fn run_with_config(cfg: Config) -> Result<()> {
                     let country_db = country_db.clone();
                     let known_gateways = known_gateways.clone();
                     let amqp_server_address = c.amqp_server_address.clone();
+                    let monitor_tasks_map = monitor_tasks_map.clone();
 
                     tokio::spawn(async move {
                         // Create metrics for a few popular countries ahead of time.
@@ -128,6 +135,9 @@ async fn run_with_config(cfg: Config) -> Result<()> {
 
                         loop {
                             let country_db = country_db.clone();
+                            // let monitor_tasks = MonitorTasks::create(&name).await;
+                            let monitor_tasks = MonitorTasks::create().await;
+                            monitor_tasks_map.write().await.insert(name.clone(), monitor_tasks);
                             let res = connect_and_receive(
                                 &mut metrics_by_country,
                                 &name,
@@ -135,6 +145,8 @@ async fn run_with_config(cfg: Config) -> Result<()> {
                                 &routing_keys,
                                 country_db,
                                 &known_gateways,
+                                // &monitor_tasks,
+                                &monitor_tasks_map,
                             )
                             .await;
 
@@ -147,7 +159,7 @@ async fn run_with_config(cfg: Config) -> Result<()> {
                                 "server {}, monitor {}: sleeping for one second",
                                 amqp_server_address, name
                             );
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         }
                     })
                 })
@@ -171,6 +183,8 @@ async fn connect_and_receive(
     routing_keys: &[RoutingKeyInformation],
     country_db: Arc<maxminddb::Reader<Vec<u8>>>,
     known_gateways: &Arc<RwLock<HashSet<String>>>,
+    // monitor_tasks: &MonitorTasks,
+    monitor_tasks_map: &Arc<RwLock<HashMap<String, MonitorTasks>>>,
 ) -> Result<()> {
     debug!(
         "connecting to AMQP server {} at {} and subscribing to events for monitor {}...",
@@ -361,6 +375,16 @@ async fn connect_and_receive(
                                         entry.cid.path
                                     )
                                 }
+                            }
+                            // Pass the event along to the JSON encoder task
+                            let json_event = serde_json::to_value(&event).unwrap();
+
+                            // Lookup MonitorTasks for the current monitor_name
+                            let monitor_tasks = monitor_tasks_map.read().await;
+                            if let Some(monitor_tasks) = monitor_tasks.get(monitor_name) {
+                                monitor_tasks.json_encoder_task.send((monitor_name.to_string(), json_event)).unwrap();
+                            } else {
+                                error!("MonitorTasks not found for monitor_name: {}", monitor_name);
                             }
                         }
                     }
