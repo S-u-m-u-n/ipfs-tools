@@ -10,6 +10,8 @@ use tokio::time::interval;
 use tokio::time::Duration;
 use itertools::Itertools;
 
+const SECONDS: u64 = 60 * 1;
+
 pub struct MonitorTasks {
     pub json_encoder_task: mpsc::UnboundedSender<(String, Value)>,
 }
@@ -23,7 +25,7 @@ impl MonitorTasks {
         let file_tx_clone = file_tx.clone();
         tokio::spawn(async move {
             let mut events_buffer: Vec<(String, Value)> = Vec::new();
-            let buffer_duration = Duration::from_secs(60 * 2); // 1 hour
+            let buffer_duration = Duration::from_secs(SECONDS); // 1 hour
 
             loop {
                 let timeout = tokio::time::sleep(buffer_duration);
@@ -31,13 +33,14 @@ impl MonitorTasks {
 
                 tokio::select! {
                     _ = &mut timeout => {
+                        info!("Timeout triggered");
                         let events_by_monitor = events_buffer
                             .drain(..)
                             .into_group_map();
 
                         for (monitor_name, events) in events_by_monitor {
                             let json_lines = events.into_iter()
-                                .map(|event| serde_json::to_string_pretty(&event).unwrap().replace("\n", "").replace(" ", "") + "\n")
+                                .map(|event| serde_json::to_string(&event).unwrap().replace("\n", "").replace(" ", "") + "\n")
                                 .collect::<Vec<_>>()
                                 .join("");
 
@@ -55,7 +58,7 @@ impl MonitorTasks {
         // File writing task
         tokio::spawn(async move {
             let mut buffer: Vec<(String, String)> = Vec::new();
-            let mut interval = interval(Duration::from_secs(120));
+            let mut interval = interval(Duration::from_secs(SECONDS));
 
             loop {
                 tokio::select! {
@@ -72,7 +75,7 @@ impl MonitorTasks {
 
                             for (monitor_name, lines) in lines_by_monitor {
                                 if let Err(e) = MonitorTasks::batch_write_to_file(&monitor_name, &lines).await {
-                                    eprintln!("Error writing to file: {}", e);
+                                    error!("Error writing to file: {}", e);
                                 }
                             }
                         }
@@ -91,12 +94,14 @@ impl MonitorTasks {
         let file_name = format!("/ipfs-tools/archive/{}/{}.json.gz", monitor_name, date);
         let file_path = Path::new(&file_name);
         let file = File::create(file_path)?;
+        info!("File created: {}", file_name);
         let encoder = GzEncoder::new(file, Compression::default());
         let mut writer = LineWriter::new(encoder);
-    
+
         writer.write_all(json_lines.as_bytes())?;
         writer.flush()?;
-    
+        info!("Data written to file: {}", file_name);
+
         Ok(())
     }
 }
