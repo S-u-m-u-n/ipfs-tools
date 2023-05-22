@@ -221,12 +221,6 @@ impl InterMonitorMatcher {
         peer_id: String,
         ingest_result: IngestResult,
     ) -> Result<Vec<OutputCSVWantlistEntry>> {
-        if let Some(conn_event) = ingest_result.connection_event {
-            debug!(
-                "ingest result contained connection event {:?}, ignoring...",
-                conn_event
-            );
-        }
 
         let output_entries = if let Some(entries) = ingest_result.wantlist_entries {
             self.stats.total_entries += entries.len();

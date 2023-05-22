@@ -1,6 +1,5 @@
 use crate::Result;
 use failure::{err_msg, ResultExt};
-use parity_multiaddr::Multiaddr;
 use serde::{Deserialize, Serialize};
 use serde_repr::*;
 use std::collections::HashMap;
@@ -38,17 +37,59 @@ pub struct JSONWantlistEntry {
 
 /// A wantlist message.
 /// These are produced by the modified Go implementation of IPFS.
+// #[derive(Clone, Serialize, Deserialize, Debug)]
+// pub struct JSONMessage {
+//     pub timestamp: chrono::DateTime<chrono::Utc>,
+//     pub peer: String,
+//     pub address: Option<Multiaddr>,
+//     pub received_entries: Option<Vec<JSONWantlistEntry>>,
+//     pub full_want_list: Option<bool>,
+//     pub peer_connected: Option<bool>,
+//     pub peer_disconnected: Option<bool>,
+//     pub connect_event_peer_found: Option<bool>,
+// }
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// A monitoring-related event.
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct JSONMessage {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub peer: String,
-    pub address: Option<Multiaddr>,
-    pub received_entries: Option<Vec<JSONWantlistEntry>>,
-    pub full_want_list: Option<bool>,
-    pub peer_connected: Option<bool>,
-    pub peer_disconnected: Option<bool>,
-    pub connect_event_peer_found: Option<bool>,
+    #[serde(rename = "bitswap_message")]
+    pub inner: BitswapMessage,
 }
+
+/// A Bitswap message received by the monitor and subsequently pushed to us via TCP.
+/// This contains both "requests" (updates to the wantlist) as well as "responses" (blocks
+/// and block presences).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct BitswapMessage {
+    pub wantlist_entries: Vec<JSONWantlistEntry>,
+    pub full_wantlist: bool,
+    pub blocks: Vec<JsonCID>,
+    pub block_presences: Vec<BlockPresence>,
+    pub connected_addresses: Vec<String>,
+}
+
+/// Block presence indication, as contained in a Bitswap message.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct BlockPresence {
+    pub cid: JsonCID,
+    pub block_presence_type: BlockPresenceType,
+}
+
+/// Block presence type constants for monitoring events.
+#[derive(Serialize_repr, Deserialize_repr, Debug, Copy, Clone)]
+#[repr(u8)]
+pub enum BlockPresenceType {
+    Have = 0,
+    DontHave = 1,
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 
 /// Message type constants for CSV files.
 pub const CSV_MESSAGE_TYPE_INCREMENTAL: i32 = 1;
@@ -160,7 +201,12 @@ impl CSVWantlistEntry {
                 timestamp_seconds: message_timestamp_seconds,
                 timestamp_subsec_milliseconds: message_timestamp_subsec_millis,
                 peer_id: message.peer.clone(),
-                address: match &message.address {
+                // address: message.inner.connected_addresses[0]
+                // address: match &message.address {
+                //     Some(address) => address.to_string(),
+                //     None => "".to_string(),
+                // },
+                address: match message.inner.connected_addresses.get(0) {
                     Some(address) => address.to_string(),
                     None => "".to_string(),
                 },
@@ -176,15 +222,13 @@ impl CSVWantlistEntry {
     }
 
     pub fn from_json_message(message: JSONMessage, id: i64) -> Result<Vec<CSVWantlistEntry>> {
-        let entries = message
-            .received_entries
-            .ok_or_else(|| err_msg("no entries when converting from JSON message"))?;
+        let entries = message.inner.wantlist_entries;
         let peer = message.peer.clone();
         let timestamp = message.timestamp;
         let timestamp_seconds = timestamp.timestamp();
         let timestamp_subsec_millis = timestamp.timestamp_subsec_millis();
-        let full_want_list = message.full_want_list;
-        let address = match &message.address {
+        let full_want_list = message.inner.full_wantlist;
+        let address = match message.inner.connected_addresses.get(0) {
             Some(address) => address.to_string(),
             None => "".to_string(),
         };
@@ -193,18 +237,10 @@ impl CSVWantlistEntry {
             .into_iter()
             .map(|entry| CSVWantlistEntry {
                 message_id: id,
-                message_type: match full_want_list {
-                    Some(full) => {
-                        if full {
-                            CSV_MESSAGE_TYPE_FULL
-                        } else {
-                            CSV_MESSAGE_TYPE_INCREMENTAL
-                        }
-                    }
-                    None => {
-                        // TODO forbid this
-                        CSV_MESSAGE_TYPE_INCREMENTAL
-                    }
+                message_type: if full_want_list {
+                    CSV_MESSAGE_TYPE_FULL
+                } else {
+                    CSV_MESSAGE_TYPE_INCREMENTAL
                 },
                 timestamp_seconds,
                 timestamp_subsec_milliseconds: timestamp_subsec_millis,
@@ -240,75 +276,6 @@ impl CSVWantlistEntry {
             .collect();
 
         Ok(csv_entries)
-    }
-}
-
-/// A connection event, to be serialized as CSV.
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct CSVConnectionEvent {
-    /// A synthetic counter which is incremented for every object in the stream of logged
-    /// `JSONMessage`s.
-    /// This is used to group want_list entries from the same message etc.
-    pub message_id: i64,
-
-    /// Timestamp as seconds since the Unix epoch.
-    pub timestamp_seconds: i64,
-    /// Sub-second milliseconds of the timestamp.
-    pub timestamp_subsec_millis: u32,
-
-    /// The human-readable ID of the sending peer.
-    pub peer_id: String,
-    /// The underlay multiaddress of the sending peer, if available.
-    pub address: String,
-    /// The type of the connection event, see the `CSV_CONNECTION_TYPE_` constants.
-    pub event_type: i32,
-}
-
-impl CSVConnectionEvent {
-    pub fn from_json_message(message: JSONMessage, id: i64) -> Result<CSVConnectionEvent> {
-        let found = message
-            .connect_event_peer_found
-            .ok_or_else(|| err_msg("connection event is missing found"))?;
-        let disconnected = message
-            .peer_disconnected
-            .ok_or_else(|| err_msg("connection event is missing peer_disconnected"))?;
-        let connected = message
-            .peer_connected
-            .ok_or_else(|| err_msg("connection event is missing peer_connected"))?;
-        ensure!(
-            disconnected || connected,
-            "connection event needs either connected or disconnected to be set..."
-        );
-        ensure!(
-            !(disconnected && connected),
-            "connection event needs exactly one of connected or disconnected to be set"
-        );
-
-        let event_type = if disconnected {
-            if found {
-                CSV_CONNECTION_EVENT_DISCONNECTED_FOUND
-            } else {
-                CSV_CONNECTION_EVENT_DISCONNECTED_NOT_FOUND
-            }
-        } else {
-            if found {
-                CSV_CONNECTION_EVENT_CONNECTED_FOUND
-            } else {
-                CSV_CONNECTION_EVENT_CONNECTED_NOT_FOUND
-            }
-        };
-
-        Ok(CSVConnectionEvent {
-            message_id: id,
-            timestamp_seconds: message.timestamp.timestamp(),
-            timestamp_subsec_millis: message.timestamp.timestamp_subsec_millis(),
-            peer_id: message.peer,
-            address: match &message.address {
-                Some(address) => address.to_string(),
-                None => "".to_string(),
-            },
-            event_type,
-        })
     }
 }
 
@@ -371,11 +338,6 @@ pub struct EngineSimulationConfig {
     /// For anything remotely new, this should be set to `false`.
     pub allow_empty_full_wantlist: bool,
 
-    /// Whether to allow the `peer_connected` and `peer_disconnected` fields to be unspecified in
-    /// JSON messages.
-    /// This should usually be set to `false` when dealing with modern recordings.
-    pub allow_empty_connection_event: bool,
-
     /// Whether to emit `SYNTHETIC_CANCEL` records for entries "canceled" through a `full_wantlist`.
     pub insert_full_wantlist_synth_cancels: bool,
     /// Whether to emit `SYNTHETIC_CANCEL` records for entries "canceled" through the peer
@@ -411,7 +373,6 @@ impl EngineSimulation {
 pub struct IngestResult {
     pub missing_ledger: bool,
     pub wantlist_entries: Option<Vec<CSVWantlistEntry>>,
-    pub connection_event: Option<CSVConnectionEvent>,
 }
 
 impl EngineSimulation {
@@ -471,7 +432,7 @@ impl EngineSimulation {
     ) -> Result<IngestResult> {
         let mut missing_ledger = false;
         let ledger = self.peers.entry(msg.peer.clone()).or_insert_with(|| {
-            debug!("received wantlist from {} ({:?}), but don't have a ledger for that peer. Starting empty one with one connection.", msg.peer, msg.address);
+            debug!("received wantlist from {} ({:?}), but don't have a ledger for that peer. Starting empty one with one connection.", msg.peer, msg.inner.connected_addresses.get(0));
             missing_ledger = true;
             Ledger { connection_count: 1, wanted_entries: Default::default(), wanted_entries_before_disconnect: Default::default(), connected_ts: Some(msg.timestamp.clone()) }
         });
@@ -503,47 +464,36 @@ impl EngineSimulation {
         );
 
         // Now update the ledger.
-        match &msg.full_want_list {
-            Some(full) => match full {
-                true => {
-                    let new_wants = new_wants
-                        .iter()
-                        .map(|c| WantlistEntry {
-                            cid: c.cid.path.clone(),
-                            ts: msg.timestamp.clone(),
-                            want_type: WantType::from_json_entry(c),
-                        })
-                        .collect();
-                    let old_wants = mem::replace(&mut ledger.wanted_entries, new_wants);
-                    ledger
-                        .wanted_entries
-                        .sort_unstable_by(|e1, e2| e1.cid.cmp(&e2.cid));
-                    ensure!(
-                        !Self::check_ledger_for_duplicates(&ledger.wanted_entries),
-                        "ledger contains duplicates"
+        match msg.inner.full_wantlist {
+            true => {
+                let new_wants = new_wants
+                    .iter()
+                    .map(|c| WantlistEntry {
+                        cid: c.cid.path.clone(),
+                        ts: msg.timestamp.clone(),
+                        want_type: WantType::from_json_entry(c),
+                    })
+                    .collect();
+                let old_wants = mem::replace(&mut ledger.wanted_entries, new_wants);
+                ledger
+                    .wanted_entries
+                    .sort_unstable_by(|e1, e2| e1.cid.cmp(&e2.cid));
+                ensure!(
+                    !Self::check_ledger_for_duplicates(&ledger.wanted_entries),
+                    "ledger contains duplicates"
+                );
+        
+                let (full_wl_dups_t, full_wl_synth_cancels_t) =
+                    Self::get_duplicate_entries_and_synth_cancels_from_full_wantlist(
+                        old_wants,
+                        &ledger.wanted_entries,
                     );
-
-                    let (full_wl_dups_t, full_wl_synth_cancels_t) =
-                        Self::get_duplicate_entries_and_synth_cancels_from_full_wantlist(
-                            old_wants,
-                            &ledger.wanted_entries,
-                        );
-                    full_wl_dups = full_wl_dups_t;
-                    if self.cfg.insert_full_wantlist_synth_cancels {
-                        full_wl_synth_cancels = full_wl_synth_cancels_t;
-                    }
+                full_wl_dups = full_wl_dups_t;
+                if self.cfg.insert_full_wantlist_synth_cancels {
+                    full_wl_synth_cancels = full_wl_synth_cancels_t;
                 }
-                false => {
-                    Self::apply_new_entries(
-                        &mut ledger.wanted_entries,
-                        new_wants,
-                        new_cancels,
-                        &msg.peer,
-                        msg.timestamp.clone(),
-                    )?;
-                }
-            },
-            None => {
+            }
+            false => {
                 if self.cfg.allow_empty_full_wantlist {
                     debug!("got empty full_want_list, assuming incremental.");
                     Self::apply_new_entries(
@@ -692,7 +642,6 @@ impl EngineSimulation {
         Ok(IngestResult {
             missing_ledger,
             wantlist_entries: Some(entries),
-            connection_event: None,
         })
     }
 
@@ -855,185 +804,19 @@ impl EngineSimulation {
         }
     }
 
-    fn ingest_connection_event(&mut self, msg: &JSONMessage, msg_id: i64) -> Result<IngestResult> {
-        debug!("ingesting connection event {:?}", msg);
-        let mut missing_ledger = false;
-        match &msg.peer_disconnected {
-            Some(disconnected) => {
-                let found = msg.connect_event_peer_found.ok_or_else(|| {
-                    err_msg(
-                        "message had peer_disconnected set but connect_event_peer_found missing",
-                    )
-                })?;
-
-                if *disconnected {
-                    // Disconnected, decrement connection counter.
-                    let ledger = self.peers.entry(msg.peer.clone()).or_insert_with(|| {
-                        if found {
-                            debug!("disconnect event had connect_event_peer_found=true, but we don't have a ledger for peer {}", msg.peer);
-                        }
-                        // If not present, we return a fresh entry with one connection, because we
-                        // decrement the counter right away.
-                        debug!("creating new ledger with one connection for peer {} since we got a disconnection event",msg.peer);
-                        missing_ledger = true;
-                        Ledger { connection_count: 1, wanted_entries: Default::default(), wanted_entries_before_disconnect: Default::default(), connected_ts: Some(msg.timestamp.clone()) }
-                    });
-                    debug!("working on ledger {:?}", ledger);
-
-                    ledger.connection_count -= 1;
-                    if ledger.connection_count < 0 {
-                        warn!(
-                            "got disconnected from disconnected peer. Setting connection count to zero. Ledger: {:?}, message: {:?}",
-                            ledger,
-                            msg
-                        );
-                        ledger.connection_count = 0;
-                    }
-
-                    if ledger.connection_count == 0 {
-                        if !ledger.wanted_entries.is_empty() {
-                            debug!("found wanted entries, generating synthetic CANCELs");
-                            ledger.wanted_entries_before_disconnect =
-                                Some(mem::take(&mut ledger.wanted_entries));
-
-                            return Ok(IngestResult {
-                                missing_ledger,
-                                wantlist_entries: if self.cfg.insert_disconnect_synth_cancels {
-                                    // emit synthetic cancels for the disconnect
-                                    Some(CSVWantlistEntry::from_wantlist_entries(
-                                        ledger.wanted_entries_before_disconnect.clone().unwrap(),
-                                        msg,
-                                        msg_id,
-                                        CSV_MESSAGE_TYPE_SYNTHETIC,
-                                        CSV_ENTRY_TYPE_SYNTHETIC_CANCEL_DISCONNECT,
-                                        CSV_DUPLICATE_STATUS_NO_DUP,
-                                        0,
-                                    ))
-                                } else {
-                                    None
-                                },
-                                connection_event: Some(
-                                    CSVConnectionEvent::from_json_message(msg.clone(), msg_id)
-                                        .unwrap(),
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-            None => {
-                if self.cfg.allow_empty_connection_event {
-                    warn!(
-                        "got empty message and no connection event from message {:?}",
-                        msg
-                    );
-                } else {
-                    error!(
-                        "got empty message and no connection event from message {:?}",
-                        msg
-                    );
-                    return Err(err_msg("got no wantlist entries and no connection event"));
-                }
-            }
-        }
-
-        match &msg.peer_connected {
-            Some(connected) => {
-                let found = msg.connect_event_peer_found.ok_or_else(|| {
-                    err_msg("message had peer_connected set but connect_event_peer_found missing")
-                })?;
-
-                if *connected {
-                    // Connected, increment connection counter :)
-                    let ledger = self.peers.get_mut(&msg.peer);
-                    match ledger {
-                        Some(ledger) => {
-                            if found && ledger.connection_count == 0 {
-                                warn!("connect event had connect_event_peer_found=true, but our ledger has zero connections for peer {}", msg.peer);
-                            } else if !found && ledger.connection_count > 0 {
-                                warn!("connect event had connect_event_peer_found=false, but we have a ledger with at least one connection for peer {}", msg.peer);
-                                // To be consistent with IPFS behaviour, we assume IPFS is right
-                                // about found==false and didn't report an earlier disconnect.
-                                // That means we need to clear out our ledger.
-                                let entries = mem::take(&mut ledger.wanted_entries);
-                                ledger.wanted_entries_before_disconnect = Some(entries);
-                            }
-                        }
-                        None => {
-                            if found {
-                                warn!("connect event had connect_event_peer_found=true, but we don't have a ledger for peer {}", msg.peer);
-                            }
-                        }
-                    }
-
-                    let ledger = self.peers.entry(msg.peer.clone()).or_insert_with(|| {
-                        debug!("creating new ledger for connection event");
-                        Ledger {
-                            connection_count: 0,
-                            wanted_entries: Default::default(),
-                            wanted_entries_before_disconnect: Default::default(),
-                            connected_ts: Some(msg.timestamp.clone()),
-                        }
-                    });
-                    debug!("working with ledger {:?}", ledger);
-
-                    ledger.connection_count += 1;
-                }
-            }
-            None => {
-                if self.cfg.allow_empty_connection_event {
-                    warn!(
-                        "got empty message and no connection event from message {:?}",
-                        msg
-                    );
-                } else {
-                    error!(
-                        "got empty message and no connection event from message {:?}",
-                        msg
-                    );
-                    return Err(err_msg("got no wantlist entries and no connection event"));
-                }
-            }
-        }
-        Ok(IngestResult {
-            missing_ledger,
-            wantlist_entries: None,
-            connection_event: Some(
-                CSVConnectionEvent::from_json_message(msg.clone(), msg_id).unwrap(),
-            ),
-        })
-    }
-
     /// Ingests a new message, advancing the simulation and emitting entries.
     pub fn ingest(&mut self, msg: &JSONMessage, msg_id: i64) -> Result<IngestResult> {
-        match &msg.received_entries {
-            Some(entries) => {
-                // This is a wantlist message.
-                debug!(
-                    "ledger before ingestion of wantlist message is {:?}",
-                    self.peers.get(&msg.peer)
-                );
-                let res = self.ingest_wantlist_message(msg, entries, msg_id);
-                debug!(
-                    "ledger after ingestion of wantlist message is {:?}",
-                    self.peers.get(&msg.peer)
-                );
-                res
-            }
-            None => {
-                // This is a connection event.
-                debug!(
-                    "ledger before ingestion of connection event is {:?}",
-                    self.peers.get(&msg.peer)
-                );
-                let res = self.ingest_connection_event(msg, msg_id);
-                debug!(
-                    "ledger after ingestion of connection event is {:?}",
-                    self.peers.get(&msg.peer)
-                );
-                res
-            }
-        }
+        // This is a wantlist message.
+        debug!(
+            "ledger before ingestion of wantlist message is {:?}",
+            self.peers.get(&msg.peer)
+        );
+        let res = self.ingest_wantlist_message(msg, &msg.inner.wantlist_entries, msg_id);
+        debug!(
+            "ledger after ingestion of wantlist message is {:?}",
+            self.peers.get(&msg.peer)
+        );
+        res
     }
 
     fn split_wants_cancels(

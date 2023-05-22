@@ -4,7 +4,7 @@ extern crate log;
 mod config;
 mod conntrack;
 
-use crate::conntrack::ConnectionDurationTracker;
+// use crate::conntrack::ConnectionDurationTracker;
 use clap::{App, Arg};
 use csv::Writer;
 use failure::{err_msg, ResultExt};
@@ -83,10 +83,8 @@ struct CSVLedgerCount {
 fn do_transform_single_file(
     mut infile: BufReader<GzDecoder<File>>,
     wl_writer: &mut csv::Writer<GzEncoder<BufWriter<File>>>,
-    conn_writer: &mut csv::Writer<GzEncoder<BufWriter<File>>>,
     engine: &mut wantlist::EngineSimulation,
     current_message_id: &mut i64,
-    conn_tracker: &mut ConnectionDurationTracker,
 ) -> Result<SingleFileTransformResult> {
     let mut buf = String::new();
     let mut first_message_ts = None;
@@ -105,11 +103,6 @@ fn do_transform_single_file(
         }
         last_message_ts.replace(message.timestamp);
 
-        // Add to connection tracker.
-        conn_tracker
-            .push(&message)
-            .context("unable to track connection duration")?;
-
         // Update simulated wantlists.
         let ingest_result = engine.ingest(&message, *current_message_id)?;
         debug!("ingest result: {:?}", ingest_result);
@@ -122,11 +115,6 @@ fn do_transform_single_file(
                 .iter()
                 .try_for_each(|e| wl_writer.serialize(e))
                 .context("unable to serialize wantlist entries")?;
-        }
-        if let Some(conn_event) = ingest_result.connection_event.as_ref() {
-            conn_writer
-                .serialize(conn_event)
-                .context("unable to serialize connection event")?;
         }
 
         buf.clear();
@@ -146,23 +134,8 @@ fn do_transform(cfg: config::Config) -> Result<()> {
     let mut engine = wantlist::EngineSimulation::new(cfg.simulation_config.clone())
         .context("unable to set up engine simulation")?;
     let mut current_message_id: i64 = 0;
-    let mut conn_tracker = ConnectionDurationTracker::new();
     let mut final_ts = None;
 
-    let mut conn_events_output_writer = csv::Writer::from_writer(GzEncoder::new(
-        io::BufWriter::new(
-            std::fs::File::create(cfg.connection_events_output_file.clone())
-                .context("unable to open connection events output file for writing")?,
-        ),
-        Compression::default(),
-    ));
-    let mut connection_durations_output_writer = csv::Writer::from_writer(GzEncoder::new(
-        io::BufWriter::new(
-            std::fs::File::create(cfg.connection_duration_output_file.clone())
-                .context("unable to open connection duration output file for writing")?,
-        ),
-        Compression::default(),
-    ));
     let mut ledger_count_output_writer = csv::Writer::from_writer(GzEncoder::new(
         io::BufWriter::new(
             std::fs::File::create(cfg.ledger_count_output_file.clone())
@@ -189,10 +162,8 @@ fn do_transform(cfg: config::Config) -> Result<()> {
         let transform_result = do_transform_single_file(
             input_file,
             &mut wl_output_writer,
-            &mut conn_events_output_writer,
             &mut engine,
             &mut current_message_id,
-            &mut conn_tracker,
         )
         .context(format!("unable to process file {}", path.display()))?;
         let num_messages = current_message_id - id_before;
@@ -226,23 +197,6 @@ fn do_transform(cfg: config::Config) -> Result<()> {
             transform_result.num_missing_ledgers,
             engine.num_ledgers()
         );
-    }
-
-    info!("finalizing connection tracker...");
-    if let Some(ts) = final_ts {
-        let connections = conn_tracker.finalize(ts);
-
-        info!("writing connections CSV...");
-        for (peer_id, conns) in connections.into_iter() {
-            for c in conns.into_iter() {
-                let to_encode = c.to_csv(peer_id.clone());
-                connection_durations_output_writer
-                    .serialize(to_encode)
-                    .context("unable to serialize connection metadata")?;
-            }
-        }
-    } else {
-        warn!("missing final timestamp, unable to finalize")
     }
 
     info!("finalizing engine simulation...");
