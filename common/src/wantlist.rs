@@ -464,51 +464,57 @@ impl EngineSimulation {
         );
 
         // Now update the ledger.
-        match msg.inner.full_wantlist {
-            true => {
-                let new_wants = new_wants
-                    .iter()
-                    .map(|c| WantlistEntry {
-                        cid: c.cid.path.clone(),
-                        ts: msg.timestamp.clone(),
-                        want_type: WantType::from_json_entry(c),
-                    })
-                    .collect();
-                let old_wants = mem::replace(&mut ledger.wanted_entries, new_wants);
-                ledger
-                    .wanted_entries
-                    .sort_unstable_by(|e1, e2| e1.cid.cmp(&e2.cid));
-                ensure!(
-                    !Self::check_ledger_for_duplicates(&ledger.wanted_entries),
-                    "ledger contains duplicates"
+        if msg.inner.full_wantlist {
+            let new_wants = new_wants
+                .iter()
+                .map(|c| WantlistEntry {
+                    cid: c.cid.path.clone(),
+                    ts: msg.timestamp.clone(),
+                    want_type: WantType::from_json_entry(c),
+                })
+                .collect();
+            let old_wants = mem::replace(&mut ledger.wanted_entries, new_wants);
+            ledger
+                .wanted_entries
+                .sort_unstable_by(|e1, e2| e1.cid.cmp(&e2.cid));
+            ensure!(
+                !Self::check_ledger_for_duplicates(&ledger.wanted_entries),
+                "ledger contains duplicates"
+            );
+    
+            let (full_wl_dups_t, full_wl_synth_cancels_t) =
+                Self::get_duplicate_entries_and_synth_cancels_from_full_wantlist(
+                    old_wants,
+                    &ledger.wanted_entries,
                 );
-        
-                let (full_wl_dups_t, full_wl_synth_cancels_t) =
-                    Self::get_duplicate_entries_and_synth_cancels_from_full_wantlist(
-                        old_wants,
-                        &ledger.wanted_entries,
-                    );
-                full_wl_dups = full_wl_dups_t;
-                if self.cfg.insert_full_wantlist_synth_cancels {
-                    full_wl_synth_cancels = full_wl_synth_cancels_t;
-                }
+            full_wl_dups = full_wl_dups_t;
+            if self.cfg.insert_full_wantlist_synth_cancels {
+                full_wl_synth_cancels = full_wl_synth_cancels_t;
             }
-            false => {
-                if self.cfg.allow_empty_full_wantlist {
-                    debug!("got empty full_want_list, assuming incremental.");
-                    Self::apply_new_entries(
-                        &mut ledger.wanted_entries,
-                        new_wants,
-                        new_cancels,
-                        &msg.peer,
-                        msg.timestamp.clone(),
-                    )?;
-                } else {
-                    error!("got empty full_want_list: {:?}", msg);
-                    return Err(err_msg("got empty full_want_list, should be set"));
-                }
-            }
+        } else {
+            Self::apply_new_entries(
+                &mut ledger.wanted_entries,
+                new_wants,
+                new_cancels,
+                &msg.peer,
+                msg.timestamp.clone(),
+            )?;
         }
+            // None => {
+            //     if self.cfg.allow_empty_full_wantlist {
+            //         debug!("got empty full_want_list, assuming incremental.");
+            //         Self::apply_new_entries(
+            //             &mut ledger.wanted_entries,
+            //             new_wants,
+            //             new_cancels,
+            //             &msg.peer,
+            //             msg.timestamp.clone(),
+            //         )?;
+            //     } else {
+            //         error!("got empty full_want_list: {:?}", msg);
+            //         return Err(err_msg("got empty full_want_list, should be set"));
+            //     }
+            // }
 
         let reconnect_dups = Self::get_duplicate_entries_from_reconnect(
             ledger,
